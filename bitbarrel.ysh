@@ -1,0 +1,139 @@
+# ysh has few tools for handling binary data, so bitbarrel stringifies everything
+# and ensures a known length by padding, e.g. key_size "5" becomes "005"
+const CRC_SIZE = 3
+const TIMESTAMP_SIZE = 25
+const KEY_SIZE_FIELD_SIZE = 3
+const VALUE_SIZE_FIELD_SIZE = 5
+const RECORD_HEADER_SIZE = CRC_SIZE + TIMESTAMP_SIZE + KEY_SIZE_FIELD_SIZE + VALUE_SIZE_FIELD_SIZE
+
+const MAX_KEY_SIZE = 10 ** KEY_SIZE_FIELD_SIZE - 1
+const MAX_VALUE_SIZE = 10 ** VALUE_SIZE_FIELD_SIZE - 1
+
+const USAGE_TEXT = "usage: bitbarrel.sh [directory] (default is working directory)"
+const HELP_TEXT = "supported commands: 'help', 'exit', 'get [key]', 'put [key] [value]', 'delete [key]', 'list_keys'"
+
+
+proc put (key, value) {
+  # len counts bytes I think, so I'm kind of cheating (relying on ascii being 1 bytes)
+  # is there a better way to stringify?
+  var key_size = "$[len(key)]"
+  var value_size = "$[len(value)]"
+  if (key_size > MAX_KEY_SIZE) {
+    write "key_size too long"
+    return
+  }
+  if (value_size > MAX_VALUE_SIZE) {
+    write "value_size too long"
+    return
+  }
+  # pad stringified number so field has known length
+  while (len(key_size) < KEY_SIZE_FIELD_SIZE) { setvar key_size = "0" ++ key_size }
+  while (len(value_size) < VALUE_SIZE_FIELD_SIZE) { setvar value_size = "0" ++ value_size }
+
+  # add real check
+  var crc = "crc"
+  var timestamp = $(date --utc --iso-8601="seconds")
+  # `< barrel.txt` avoids `wc` appending the file name
+  # there must be a more efficient way of getting the position -- probably from the offset in the file descriptor?
+  var position = $(wc -m < barrel.txt) + 1
+  # write "lsof: $(lsof -o -p $$)"
+  write -n "$crc$timestamp$key_size$value_size$key$value" >> "$BITBARREL_DIR/barrel.txt"
+  var record_size = RECORD_HEADER_SIZE + key_size + value_size
+  setglobal keydir[key] = {"filepath": "$BITBARREL_DIR/barrel.txt", "record_size": record_size, "position": position, "timestamp": timestamp}
+  #= keydir
+  write "ok"
+}
+
+proc get (key) {
+  try {
+    var filepath = keydir[key]["filepath"]
+    var record_position = keydir[key]["position"]
+    var record_size = keydir[key]["record_size"]
+  }
+  if (_status !== 0) {
+    write "not_found"
+    return
+  }
+  # also relying on ascii chars being 1 byte (-c counts bytes, not characters)
+  # can I switch to ysh-read ? Or maybe bash's tail and then ysh-read instead of head?
+  var record = $(tail -c +$record_position $filepath | head -c $record_size)
+  # = record
+  # reduce use of magic numbers
+  var key_size = record[28:31]
+  var value_size = record[31:36]
+  # in ysh can do arithmetic using stringified numbers because + is addition while ++ is concat
+  var offset = "36" + key_size
+  var value = record[offset:]
+  write $value
+}
+
+proc delete (key) {
+  # using put means keydir entry gets updated before it's deleted, which is unnecessary work
+  # but it's simple so leave it for now
+  put $key "X-BitBarrel-Deleted"
+  call keydir->erase(key)
+  # sort out messages so this doesn't print ok twice
+  # return message strings from functions and let the main section handle printing?
+  write "ok"
+}
+
+# could this be a func?
+proc list_keys () {
+  = keydir => keys()
+}
+
+# main
+case ($#) {
+  0 { const BITBARREL_DIR = $(pwd) }
+  1 { const BITBARREL_DIR = $1 }
+  (else) { 
+    write "bitbarrel expects 0 or 1 arguments, not $#"
+    write $USAGE_TEXT
+    exit 1 
+  }
+}
+
+# failed external commands crash the program (even inside try ?? check that again)
+# including failed < when file doesn't exist
+# feels like maybe I've overcomplicated this, though
+var keydir_exists = $(ls "$BITBARREL_DIR/keydir.json" 2>/dev/null || echo "")
+var barrel_exists = $(ls "$BITBARREL_DIR/barrel.txt" 2>/dev/null || echo "")
+if (keydir_exists === "") {
+  json write ({}) > "$BITBARREL_DIR/keydir.json"
+}
+if (barrel_exists === "") {
+  call $(touch "$BITBARREL_DIR/barrel.txt")
+}
+
+var keydir
+json read (&keydir) < "$BITBARREL_DIR/keydir.json"
+
+write $USAGE_TEXT
+write $HELP_TEXT
+
+while true {
+  write -n "\$ "
+  # doesn't accept spaces in key or value
+  # ignores extra arguments, e.g. value for get
+  var command, key, value
+  read command key value
+  case (command) {
+    "get" { get $key }
+    "put" { put $key $value }
+    "delete" { delete $key }
+    "list_keys" { list_keys }
+    "help" { write $HELP_TEXT }
+    "exit" { 
+      json write (keydir) > "$BITBARREL_DIR/keydir.json"
+      exit 0 
+    }
+    "open" { write "open not implemented" }
+    "fold" { write "fold not implemented" }
+    "merge" { write "merge not implemented" }
+    "sync" { write "sync not implemented" }
+    "close" { write "close not implemented" }
+    (else) { write "$command: not a valid command" }
+  }
+}
+
+
